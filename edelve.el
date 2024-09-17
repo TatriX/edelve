@@ -16,11 +16,20 @@ p;; Implementation notes
 (require 'map)
 (require 'bind-key)
 
+(defface edelve-breakpoint-enabled
+  '((t
+     :foreground "red1"
+     :weight bold))
+  "Face for enabled breakpoint icon in fringe."
+  :group 'edelve)
+
 (defvar edelve--connection nil)
 (defvar edelve--jsonrpc-id 0)
 
 ;; TODO: make sure we don't leak anything here!
 (defvar edelve--requests nil)
+(defvar edelve--breakpoints nil)
+(defvar edelve--breakpoint-fringes nil)
 
 (defvar edelve--process-state nil)
 (defvar edelve--process-stacktrace nil)
@@ -28,6 +37,7 @@ p;; Implementation notes
 
 (defvar edelve--eval-result nil)
 (defvar edelve--buffer nil)
+(defvar edelve--line-fringe nil)
 
 ;; TODO: this is used for debugging. Remove me
 (defvar edelve--last-response nil)
@@ -60,6 +70,9 @@ p;; Implementation notes
 
   ;; TODO: cleanup on quit as well
   (setq edelve--requests (make-hash-table))
+  (setq edelve--breakpoints (make-hash-table))
+  (setq edelve--breakpoint-fringes (make-hash-table))
+
   (setq edelve--process-state nil)
   (setq edelve--process-stacktrace nil)
   (setq edelve--process-breakpoints nil)
@@ -91,6 +104,8 @@ p;; Implementation notes
 
 (defun edelve-quit ()
   (interactive)
+  ;; TODO: remove our overlays!
+  ;; (remove-overlays)
   (delete-process edelve--connection)
   (setq edelve--connection nil))
 
@@ -99,7 +114,8 @@ p;; Implementation notes
 (defun edelve-continue ()
   (interactive)
   (edelve--send "RPCServer.Command" `((name . "continue")
-                                      (ReturnInfoLoadConfig . ,edelve--load-config))))
+                                      (ReturnInfoLoadConfig . ,edelve--load-config)))
+  (edelve--request-state))
 
 (defun edelve-halt ()
   (interactive)
@@ -167,12 +183,21 @@ p;; Implementation notes
         (pcase method
           ((or "RPCServer.State" "RPCServer.Command")
            (setq edelve--process-state (map-elt result 'State))
-           (edelve--jump-to-current-line))
+           (if (map-elt edelve--process-state 'Running)
+               (delete-overlay edelve--line-fringe)
+             (edelve--jump-to-current-line)))
           ("RPCServer.Stacktrace" (setq edelve--process-stacktrace (map-elt result 'Locations)))
           ("RPCServer.ListBreakpoints" (setq edelve--process-breakpoints (map-elt result 'Breakpoints)))
           ("RPCServer.Eval" (edelve--handle-eval-result result))
           ("RPCServer.SetApiVersion")
-          ("RPCServer.CreateBreakpoint")
+          ("RPCServer.CreateBreakpoint"
+           (let* ((breakpoint (map-elt result 'Breakpoint))
+                  (id (map-elt breakpoint 'id))
+                  (fringe (make-overlay (line-beginning-position) (line-beginning-position 2))))
+             (map-put! edelve--breakpoint-fringes id fringe)
+             (map-put! edelve--breakpoints id breakpoint)
+             (overlay-put fringe 'before-string
+                          (propertize ">" 'display (list 'left-fringe 'large-circle 'edelve-breakpoint-enabled)))))
           ("RPCServer.ClearBreakpoint")
           (_ (edelve--log "no handler for method %s" method)))
       (user-error "edelve: method %s failed: %s" method err))))
@@ -209,7 +234,14 @@ p;; Implementation notes
       (display-buffer buffer '(display-buffer-reuse-window))
       (with-current-buffer buffer
         (goto-line (map-elt loc 'line) buffer)
-        (back-to-indentation)))))
+        (back-to-indentation)
+
+        (unless edelve--line-fringe
+          (setq edelve--line-fringe (make-overlay (line-beginning-position) (line-beginning-position 2)))
+          (overlay-put edelve--line-fringe 'before-string
+                       (propertize ">" 'display (list 'left-fringe 'right-triangle))))
+
+        (move-overlay edelve--line-fringe (line-beginning-position) (line-beginning-position 2))))))
 
 (defun edelve--create-breakpoint (location)
   "Create a breakpoint at LOCATION.
@@ -364,3 +396,8 @@ Halt the process first to set a breakpoint.
 (edelve--pp-eval-result)
 
 (edelve-quit)
+
+(set-window-fringes (selected-window) 30 0)
+
+
+
