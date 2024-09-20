@@ -1,4 +1,4 @@
-p;; Implementation notes
+;; Implementation notes
 ;;
 ;; # JSON RPC
 ;;
@@ -85,6 +85,9 @@ p;; Implementation notes
     ;; TODO: don't depend on go-mode here!!!
     (go-mode))
 
+  ;; TODO: use global minor mode
+  (setq global-mode-string (list "[edlv:" '(:eval (edelve--get-process-state)) "]"))
+
   (setq edelve--jsonrpc-id 0)
   (setq edelve--connection (open-network-stream "edelve" nil "127.0.0.1" "8181"))
 
@@ -96,6 +99,7 @@ p;; Implementation notes
   (unless map
     (setq map 'go-mode-map))
   (bind-key "<f8>" #'edelve-continue map)
+  (bind-key "S-<f8>" #'edelve-halt map)
   (bind-key "<f9>" #'edelve-toggle-breakpoint map)
   (bind-key "<f10>" #'edelve-next map)
   (bind-key "<f11>" #'edelve-step map)
@@ -106,7 +110,8 @@ p;; Implementation notes
   (interactive)
   ;; TODO: remove our overlays!
   ;; (remove-overlays)
-  (delete-process edelve--connection)
+  (when (process-live-p edelve--connection)
+    (delete-process edelve--connection))
   (setq edelve--connection nil))
 
 ;; Commands
@@ -149,26 +154,29 @@ p;; Implementation notes
     (let ((thing (thing-at-point 'sexp)))
       (edelve-eval thing))))
 
+
 ;;; Private stuff
 
 ;; Connection related things
 
-(defun edelve--connection-filter (process response-string)
+(defun edelve--connection-filter (process input-string)
   (with-current-buffer (get-buffer-create "debug.json")
     (erase-buffer)
     (insert response-string)
     (json-pretty-print-buffer))
-  (let ((response (json-parse-string response-string
-                                     :object-type 'alist)))
-    (let ((id (map-elt response 'id)))
-      (if-let ((method (map-elt edelve--requests id)))
-          (progn
-            (edelve--trace "Got response with id %d for method %s" id method)
-            (map-delete edelve--requests id)
-            (edelve--handle-response method response))
-        (edelve--log "Got notification from the server (id: %d)" id)))
+  ;; NOTE: we can get multiple strings here (one as a response for our
+  ;; request, and a notification for the status change)
+  (dolist (response-string (string-split input-string "\n" t))
+    (let ((response (json-parse-string response-string :object-type 'alist)))
+      (let ((id (map-elt response 'id)))
+        (if-let ((method (map-elt edelve--requests id)))
+            (progn
+              (edelve--trace "Got response with id %d for method %s" id method)
+              (map-delete edelve--requests id)
+              (edelve--handle-response method response))
+          (edelve--log "Got notification from the server (id: %d)" id)))
 
-    (setq edelve--last-response response)))
+      (setq edelve--last-response response))))
 
 (defun edelve--send (method &optional params)
   (let ((data (json-serialize `(:method ,method :params [,params] :id ,(cl-incf edelve--jsonrpc-id)))))
@@ -261,6 +269,10 @@ Halt the process first to set a breakpoint.
 (defun edelve--get-current-goroutine-id ()
   (map-nested-elt edelve--process-state '(currentThread goroutineID)))
 
+(defun edelve--get-process-state ()
+  (let ((running (map-elt edelve--process-state 'Running)))
+    (if (eq running :false) "stop" "run")))
+
 ;; Pretty printing
 
 (defun edelve--pp-state ()
@@ -340,6 +352,7 @@ Halt the process first to set a breakpoint.
   (if nil
    (message "edelve: %s" (apply #'format fmt args))))
 
+
 ;;; Debug session
 
 (edelve--send "RPCServer.GetVersion" '())
@@ -398,6 +411,3 @@ Halt the process first to set a breakpoint.
 (edelve-quit)
 
 (set-window-fringes (selected-window) 30 0)
-
-
-
