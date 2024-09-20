@@ -63,21 +63,10 @@
 (defun edelve ()
   (interactive)
   (unless (json-available-p)
-    (error "Sorry, you need to have build Emacs with JSON support."))
+    (error "Sorry, you need to have Emacs build with native JSON support."))
 
-  (when edelve--connection
-    (warn "There's a hanging connection. FIXME"));
+  (edelve--reset-state)
 
-  ;; TODO: cleanup on quit as well
-  (setq edelve--requests (make-hash-table))
-  (setq edelve--breakpoints (make-hash-table))
-  (setq edelve--breakpoint-fringes (make-hash-table))
-
-  (setq edelve--process-state nil)
-  (setq edelve--process-stacktrace nil)
-  (setq edelve--process-breakpoints nil)
-  (setq edelve--last-response nil)
-  (setq edelve--eval-result nil)
   (setq edelve--buffer (get-buffer-create "*edelve*"))
 
   (with-current-buffer edelve--buffer
@@ -86,14 +75,16 @@
     (go-mode))
 
   ;; TODO: use global minor mode
-  (setq global-mode-string (list "[edlv:" '(:eval (edelve--get-process-state)) "]"))
+  (setq global-mode-string '(:eval (if-let (state (edelve--get-process-state))
+                                       (format "[edlv:%s]" state)
+                                     "[edlv]")))
 
-  (setq edelve--jsonrpc-id 0)
   (setq edelve--connection (open-network-stream "edelve" nil "127.0.0.1" "8181"))
 
   (set-process-filter edelve--connection #'edelve--connection-filter)
 
-  (edelve--send "RPCServer.SetApiVersion" '((APIVersion . 2))))
+  (edelve--send "RPCServer.SetApiVersion" '((APIVersion . 2)))
+  (edelve--request-state))
 
 (defun edelve-setup-default-keymap (&optional map)
   (unless map
@@ -108,11 +99,7 @@
 
 (defun edelve-quit ()
   (interactive)
-  ;; TODO: remove our overlays!
-  ;; (remove-overlays)
-  (when (process-live-p edelve--connection)
-    (delete-process edelve--connection))
-  (setq edelve--connection nil))
+  (edelve--reset-state))
 
 ;; Commands
 
@@ -138,7 +125,11 @@
   (interactive)
   (let ((loc (format "%s:%d" (buffer-file-name) (line-number-at-pos))))
     (edelve--log "Setting breakpoint at %s" loc)
-    (edelve--create-breakpoint loc)))
+    (if (eq (edelve--get-process-state) 'stop)
+        (edelve--create-breakpoint loc)
+      (edelve-halt)
+      (edelve--create-breakpoint loc)
+      (edelve-continue))))
 
 (defun edelve-eval (&optional expr)
   (interactive "sExpr: ")
@@ -157,6 +148,27 @@
 
 ;;; Private stuff
 
+(defun edelve--reset-state ()
+  ;; TODO: remove our overlays!
+  ;; (remove-overlays)
+
+  (when (process-live-p edelve--connection)
+    (delete-process edelve--connection))
+
+  (setq edelve--connection nil)
+
+  (setq edelve--requests (make-hash-table))
+  (setq edelve--breakpoints (make-hash-table))
+  (setq edelve--breakpoint-fringes (make-hash-table))
+
+  (setq edelve--process-state nil)
+  (setq edelve--process-stacktrace nil)
+  (setq edelve--process-breakpoints nil)
+  (setq edelve--last-response nil)
+  (setq edelve--eval-result nil)
+
+  (setq edelve--jsonrpc-id 0))
+
 ;; Connection related things
 
 (defun edelve--connection-filter (process input-string)
@@ -167,19 +179,23 @@
   ;; NOTE: we can get multiple strings here (one as a response for our
   ;; request, and a notification for the status change)
   (dolist (response-string (string-split input-string "\n" t))
-    (let ((response (json-parse-string response-string :object-type 'alist)))
-      (let ((id (map-elt response 'id)))
-        (if-let ((method (map-elt edelve--requests id)))
-            (progn
-              (edelve--trace "Got response with id %d for method %s" id method)
-              (map-delete edelve--requests id)
-              (edelve--handle-response method response))
-          (edelve--log "Got notification from the server (id: %d)" id)))
+    (let* ((response (json-parse-string response-string :object-type 'alist))
+           (id (map-elt response 'id)))
+      (if (eq id :null)
+          (edelve--log "Got notification from the server (id: %d)" id)
+        (let ((method (map-elt edelve--requests id)))
+          (cl-assert method)
+          (edelve--trace "Got response with id %d for method %s" id method)
+          (map-delete edelve--requests id)
+          (edelve--handle-response method response)))
 
       (setq edelve--last-response response))))
 
 (defun edelve--send (method &optional params)
-  (let ((data (json-serialize `(:method ,method :params [,params] :id ,(cl-incf edelve--jsonrpc-id)))))
+  ;; NOTE dlv uses jsonrpc 1.0
+  (let ((data (json-serialize `((method . ,method)
+                                (params . [,params])
+                                (id  . ,(cl-incf edelve--jsonrpc-id))))))
     (edelve--trace "Sending %s" data)
     (map-put! edelve--requests edelve--jsonrpc-id method)
     (process-send-string edelve--connection data)))
@@ -191,9 +207,9 @@
         (pcase method
           ((or "RPCServer.State" "RPCServer.Command")
            (setq edelve--process-state (map-elt result 'State))
-           (if (map-elt edelve--process-state 'Running)
-               (delete-overlay edelve--line-fringe)
-             (edelve--jump-to-current-line)))
+           (pcase (edelve--get-process-state)
+             ('run (delete-overlay edelve--line-fringe))
+             ('stop (edelve--jump-to-current-line))))
           ("RPCServer.Stacktrace" (setq edelve--process-stacktrace (map-elt result 'Locations)))
           ("RPCServer.ListBreakpoints" (setq edelve--process-breakpoints (map-elt result 'Breakpoints)))
           ("RPCServer.Eval" (edelve--handle-eval-result result))
@@ -221,7 +237,7 @@
 
 (defun edelve--request-state ()
   "Request program state even the program is running"
-  (edelve--send "RPCServer.State" '(:NonBlocking t)))
+  (edelve--send "RPCServer.State" '((NonBlocking . t))))
 
 
 (defun edelve--request-stacktrace ()
@@ -247,7 +263,7 @@
         (unless edelve--line-fringe
           (setq edelve--line-fringe (make-overlay (line-beginning-position) (line-beginning-position 2)))
           (overlay-put edelve--line-fringe 'before-string
-                       (propertize ">" 'display (list 'left-fringe 'right-triangle))))
+                       (propertize ">" 'display '(left-fringe right-triangle))))
 
         (move-overlay edelve--line-fringe (line-beginning-position) (line-beginning-position 2))))))
 
@@ -270,8 +286,10 @@ Halt the process first to set a breakpoint.
   (map-nested-elt edelve--process-state '(currentThread goroutineID)))
 
 (defun edelve--get-process-state ()
-  (let ((running (map-elt edelve--process-state 'Running)))
-    (if (eq running :false) "stop" "run")))
+  (if edelve--process-state
+      (let ((running (map-elt edelve--process-state 'Running)))
+        (if (eq running :false) 'stop 'run))
+    nil))
 
 ;; Pretty printing
 
@@ -322,8 +340,10 @@ Halt the process first to set a breakpoint.
     (princ (format (concat "%" (number-to-string (* 4 depth)) "s") "") stream))
   (let ((kind (aref edelve--go-kinds (map-elt variable 'kind))))
     (pcase kind
-      ('Pointer (princ (format "%s: *" (map-elt variable 'name)) stream)
-                (edelve--pp-variable (seq-elt (map-elt variable 'children) 0) stream depth t))
+      ('Pointer (if (equal (map-elt variable 'value) "0")
+                    (princ (format "%s %s: nil\n" (map-elt variable 'name) (map-elt variable 'type)) stream)
+                  (princ (format "%s: *" (map-elt variable 'name)) stream)
+                  (edelve--pp-variable (seq-elt (map-elt variable 'children) 0) stream depth t)))
       ('Struct (let ((children (map-elt variable 'children)))
                  (unless is-pointer
                    (princ (format "%s: " (map-elt variable 'name)) stream))
