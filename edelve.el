@@ -1,3 +1,5 @@
+;; -*- lexical-binding: t; -*-
+;;
 ;; Implementation notes
 ;;
 ;; # JSON RPC
@@ -123,12 +125,20 @@
 
 (defun edelve-toggle-breakpoint ()
   (interactive)
-  (let ((loc (format "%s:%d" (buffer-file-name) (line-number-at-pos))))
-    (edelve--log "Setting breakpoint at %s" loc)
+  (let* ((file (buffer-file-name))
+         (line (line-number-at-pos))
+         (loc (format "%s:%d" file line))
+         (action (if-let ((breakpoint (edelve--get-breakpoint file line)))
+                     (lambda ()
+                       (edelve--log "Clearing breakpoint at %s" loc)
+                       (edelve--clear-breakpoint (map-elt breakpoint 'id)))
+                   (lambda ()
+                     (edelve--log "Setting breakpoint at %s" loc)
+                     (edelve--create-breakpoint loc)))))
     (if (eq (edelve--get-process-state) 'stop)
-        (edelve--create-breakpoint loc)
+        (funcall action)
       (edelve-halt)
-      (edelve--create-breakpoint loc)
+      (funcall action)
       (edelve-continue))))
 
 (defun edelve-eval (&optional expr)
@@ -205,26 +215,21 @@
         (err (map-elt response 'error)))
     (if (eq err :null)
         (pcase method
-          ((or "RPCServer.State" "RPCServer.Command")
-           (setq edelve--process-state (map-elt result 'State))
-           (pcase (edelve--get-process-state)
-             ('run (delete-overlay edelve--line-fringe))
-             ('stop (edelve--jump-to-current-line))))
+          ("RPCServer.SetApiVersion")
+          ((or "RPCServer.State" "RPCServer.Command") (edelve--handle-state (map-elt result 'State)))
           ("RPCServer.Stacktrace" (setq edelve--process-stacktrace (map-elt result 'Locations)))
           ("RPCServer.ListBreakpoints" (setq edelve--process-breakpoints (map-elt result 'Breakpoints)))
-          ("RPCServer.Eval" (edelve--handle-eval-result result))
-          ("RPCServer.SetApiVersion")
-          ("RPCServer.CreateBreakpoint"
-           (let* ((breakpoint (map-elt result 'Breakpoint))
-                  (id (map-elt breakpoint 'id))
-                  (fringe (make-overlay (line-beginning-position) (line-beginning-position 2))))
-             (map-put! edelve--breakpoint-fringes id fringe)
-             (map-put! edelve--breakpoints id breakpoint)
-             (overlay-put fringe 'before-string
-                          (propertize ">" 'display (list 'left-fringe 'large-circle 'edelve-breakpoint-enabled)))))
-          ("RPCServer.ClearBreakpoint")
+          ("RPCServer.Eval" (edelve--handle-eval-result result)) ;; TODO: unify with the others
+          ("RPCServer.CreateBreakpoint" (edelve--handle-create-breakpoint (map-elt result 'Breakpoint)))
+          ("RPCServer.ClearBreakpoint" (edelve--handle-clear-breakpoint (map-elt result 'Breakpoint)))
           (_ (edelve--log "no handler for method %s" method)))
       (user-error "edelve: method %s failed: %s" method err))))
+
+(defun edelve--handle-state (state)
+  (setq edelve--process-state state)
+  (pcase (edelve--get-process-state)
+    ('run (delete-overlay edelve--line-fringe))
+    ('stop (edelve--jump-to-current-line))))
 
 (defun edelve--handle-eval-result (result)
   (setq edelve--eval-result (map-elt result 'Variable))
@@ -232,6 +237,22 @@
     (erase-buffer)
     (insert (with-output-to-string (edelve--pp-variable edelve--eval-result)))
     (display-buffer edelve--buffer 'display-buffer-reuse-window)))
+
+(defun edelve--handle-create-breakpoint (breakpoint)
+  (edelve--request-breakpoints)
+  (let ((id (map-elt breakpoint 'id))
+        (fringe (make-overlay (line-beginning-position) (line-beginning-position 2))))
+    (map-put! edelve--breakpoint-fringes id fringe)
+    (map-put! edelve--breakpoints id breakpoint)
+    (overlay-put fringe 'before-string
+                 (propertize ">" 'display (list 'left-fringe 'large-circle 'edelve-breakpoint-enabled)))))
+
+(defun edelve--handle-clear-breakpoint (breakpoint)
+  (edelve--request-breakpoints)
+  (let ((id (map-elt breakpoint 'id)))
+    (delete-overlay (map-elt edelve--breakpoint-fringes id))
+    (setq edelve--breakpoint-fringes (map-delete edelve--breakpoint-fringes id))
+    (setq edelve--breakpoints (map-delete edelve--breakpoints id ))))
 
 ;; Commands
 
@@ -290,6 +311,12 @@ Halt the process first to set a breakpoint.
       (let ((running (map-elt edelve--process-state 'Running)))
         (if (eq running :false) 'stop 'run))
     nil))
+
+(defun edelve--get-breakpoint (file line)
+  (seq-find (lambda (frame)
+              (and (equal file (map-elt frame 'file))
+                   (equal line (map-elt frame 'line))))
+            edelve--process-breakpoints))
 
 ;; Pretty printing
 
