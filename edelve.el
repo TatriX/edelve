@@ -170,6 +170,54 @@
       (edelve-eval thing))))
 
 
+;;; UI stuff
+
+(defvar edelve-ui-breakpoints-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [?d] 'process-menu-delete-process)
+    map))
+
+(defun edelve-ui-breakpoints-clear-breakpoint ()
+  (interactive)
+  (let ((pos (point)))
+    (message "TODO: %s" (tabulated-list-get-id))
+    (revert-buffer)
+    (goto-char (min pos (point-max)))
+    (if (eobp)
+        (forward-line -1)
+      (beginning-of-line))))
+
+(define-derived-mode edelve-ui-breakpoints-mode tabulated-list-mode "Breakpoints"
+  "Major mode for listing edelve breakpoints."
+  (setq tabulated-list-format [("ID" 4 t)
+			       ("Location" 0 t)])
+  (setq tabulated-list-sort-key (cons "ID" nil))
+  (add-hook 'tabulated-list-revert-hook 'edelve-ui-breakpoints--refresh nil t))
+
+(defun edelve-ui-breakpoints ()
+  (interactive)
+  (let ((buffer (get-buffer-create "*edelve-breakpoints*")))
+    (with-current-buffer  buffer
+      (edelve-ui-breakpoints-mode)
+      (edelve-ui-breakpoints--refresh)
+      (tabulated-list-print))
+
+    (display-buffer buffer)))
+
+(defun edelve-ui-breakpoints--refresh ()
+  "Update breakpoints."
+  (setq tabulated-list-entries nil)
+  (seq-do (lambda (breakpoint)
+            (let ((id (map-elt breakpoint 'id))
+                  (file (map-elt breakpoint 'file))
+                  (line (map-elt breakpoint 'line)))
+              (when (> id 0)
+                (push (list id (vector (format "%d" id) (format "%s:%s" file line)))
+                      tabulated-list-entries))))
+           edelve--process-breakpoints)
+  (tabulated-list-init-header))
+
+
 ;;; Private stuff
 
 (defun edelve--reset-state ()
