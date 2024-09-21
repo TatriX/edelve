@@ -39,6 +39,7 @@
 (defvar edelve--process-state nil)
 (defvar edelve--process-stacktrace nil)
 (defvar edelve--process-breakpoints nil)
+(defvar edelve--process-stack-depth 0)
 
 (defvar edelve--eval-result nil)
 (defvar edelve--buffer nil)
@@ -101,6 +102,8 @@
   (bind-key "<f9>" #'edelve-toggle-breakpoint map)
   (bind-key "<f10>" #'edelve-next map)
   (bind-key "<f11>" #'edelve-step map)
+  (bind-key "C-c C-u" #'edelve-up map)
+  (bind-key "C-c C-d" #'edelve-down map)
   (bind-key "C-c C-e" #'edelve-eval map)
   (bind-key "C-c C-p" #'edelve-print-dwim map))
 
@@ -116,6 +119,7 @@
   (interactive)
   (edelve--ensure-halted)
   ;; TODO: Customize rebuild
+  (setq edelve--process-stack-depth 0)
   (edelve--send "RPCServer.Restart" '((Rebuild . t)))
   (edelve-continue))
 
@@ -136,6 +140,14 @@
 (defun edelve-step ()
   (interactive)
   (edelve--send "RPCServer.Command" '((name . "step"))))
+
+(defun edelve-up ()
+  (interactive)
+  (edelve--send "RPCServer.Stacktrace" `((Id . -1) (Depth . ,(cl-incf edelve--process-stack-depth)))))
+
+(defun edelve-down ()
+  (interactive)
+  (edelve--send "RPCServer.Stacktrace" `((Id . -1) (Depth . ,(cl-decf edelve--process-stack-depth)))))
 
 (defun edelve-toggle-breakpoint ()
   (interactive)
@@ -269,7 +281,7 @@
   (let ((data (json-serialize `((method . ,method)
                                 (params . [,params])
                                 (id  . ,(cl-incf edelve--jsonrpc-id))))))
-    (edelve--trace "Sending %s" data)
+    (edelve--log "Sending %s" data)
     (map-put! edelve--requests edelve--jsonrpc-id method)
     (process-send-string edelve--connection data)))
 
@@ -280,11 +292,12 @@
         (pcase method
           ("RPCServer.SetApiVersion")
           ((or "RPCServer.State" "RPCServer.Command") (edelve--handle-state (map-elt result 'State)))
-          ("RPCServer.Stacktrace" (setq edelve--process-stacktrace (map-elt result 'Locations)))
+          ("RPCServer.Stacktrace" (edelve--handle-stacktrace (map-elt result 'Locations)))
           ("RPCServer.ListBreakpoints" (setq edelve--process-breakpoints (map-elt result 'Breakpoints)))
           ("RPCServer.Eval" (edelve--handle-eval-result result)) ;; TODO: unify with the others
           ("RPCServer.CreateBreakpoint" (edelve--handle-create-breakpoint (map-elt result 'Breakpoint)))
           ("RPCServer.ClearBreakpoint" (edelve--handle-clear-breakpoint (map-elt result 'Breakpoint)))
+          ("RPCServer.Restart")
           (_ (edelve--log "no handler for method %s" method)))
       (user-error "edelve: method %s failed: %s" method err))))
 
@@ -300,6 +313,11 @@
     (erase-buffer)
     (insert (with-output-to-string (edelve--pp-variable edelve--eval-result)))
     (display-buffer edelve--buffer 'display-buffer-reuse-window)))
+
+(defun edelve--handle-stacktrace (stacktrace)
+  (setq edelve--process-stacktrace stacktrace)
+  (let ((last-location (aref edelve--process-stacktrace (1- (length edelve--process-stacktrace)))))
+    (edelve--jump-to-current-line last-location)))
 
 (defun edelve--handle-create-breakpoint (breakpoint)
   (edelve--request-breakpoints)
@@ -335,16 +353,18 @@
                                          (MaxArrayValues . 64))))
 
 (defun edelve--eval (expr)
-  (edelve--send "RPCServer.Eval" `((Scope . ((GoroutineID . -1) (Frame . 0)))
+  (edelve--send "RPCServer.Eval" `((Scope . ((GoroutineID . -1) (Frame . ,edelve--process-stack-depth)))
                                    (Expr . ,expr)
                                    (Cfg . ,edelve--load-config))))
 
-(defun edelve--jump-to-current-line ()
-  (when-let ((loc (map-nested-elt edelve--process-state '(currentGoroutine userCurrentLoc))))
-    (let ((buffer (find-file-noselect (map-elt loc 'file))))
+(defun edelve--jump-to-current-line (&optional location)
+  (unless location
+    (setq location (map-nested-elt edelve--process-state '(currentGoroutine userCurrentLoc))))
+  (when location
+    (let ((buffer (find-file-noselect (map-elt location 'file))))
       (display-buffer buffer '(display-buffer-reuse-window))
       (with-current-buffer buffer
-        (goto-line (map-elt loc 'line) buffer)
+        (goto-line (map-elt location 'line) buffer)
         (back-to-indentation)
 
         (unless edelve--line-fringe
@@ -452,12 +472,16 @@ Halt the process first to set a breakpoint.
                            children)
                    (princ (format (concat "%" (number-to-string (* 4 depth)) "s") "") stream)
                    (princ "}\n" stream))))
+      ('Slice (princ (format "%s: %s: " (map-elt variable 'name) (map-elt variable 'type))  stream)
+              (if (zerop (map-elt variable 'len))
+                  (princ "[]" stream)
+                (princ (format "???\n"))))
       ('String
        (princ (format "%s: \"%s\"\n" (map-elt variable 'name) (map-elt variable 'value)) stream))
-      ((or 'Bool 'Uint)
+      ((or 'Bool 'Uint 'Int)
        (princ (format "%s: %s\n" (map-elt variable 'name) (map-elt variable 'value)) stream))
       (_ ; (edelve--log "kind is not supported %s" kind)
-         (princ (format "%s: %s\n" (map-elt variable 'name) (map-elt variable 'type)) stream))))
+         (princ (format "%s: %s (xxx)\n" (map-elt variable 'name) (map-elt variable 'type)) stream))))
   nil)
 
 ;; Utils
