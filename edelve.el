@@ -8,10 +8,13 @@
 ;; header, which dlv doesn't support. Hence we just open a socket and
 ;; send json directly.
 
-
 ;; dlv debug --headless --api-version=2 --log --log-output=debugger,dap,rpc --listen=127.0.0.1:8181
 
 ;; TODO: json-serialize
+;; TODO: https://github.com/go-delve/delve/blob/master/Documentation/api/ClientHowto.md
+;; TODO: Introduce edelve-minor-mode
+;; TODO: Use LastModified call to check that breakpoint line numbers are still good
+;; TODO: Use https://github.com/aarzilli/delve_client_testing
 
 (require 'cl-lib)
 (require 'seq)
@@ -60,6 +63,7 @@
                           Array Chan Func Interface Map Pointer Slice String Struct
                           UnsafePointer])
 
+
 ;;; Public API
 
 (defun edelve ()
@@ -91,6 +95,7 @@
 (defun edelve-setup-default-keymap (&optional map)
   (unless map
     (setq map 'go-mode-map))
+  (bind-key "<f5>" #'edelve-restart map)
   (bind-key "<f8>" #'edelve-continue map)
   (bind-key "S-<f8>" #'edelve-halt map)
   (bind-key "<f9>" #'edelve-toggle-breakpoint map)
@@ -101,9 +106,18 @@
 
 (defun edelve-quit ()
   (interactive)
+  (edelve--ensure-halted)
+  (edelve--send "RPCServer.Detach")
   (edelve--reset-state))
 
 ;; Commands
+
+(defun edelve-restart ()
+  (interactive)
+  (edelve--ensure-halted)
+  ;; TODO: Customize rebuild
+  (edelve--send "RPCServer.Restart" '((Rebuild . t)))
+  (edelve-continue))
 
 (defun edelve-continue ()
   (interactive)
@@ -184,10 +198,11 @@
 (defun edelve--connection-filter (process input-string)
   (with-current-buffer (get-buffer-create "debug.json")
     (erase-buffer)
-    (insert response-string)
+    (insert input-string)
     (json-pretty-print-buffer))
   ;; NOTE: we can get multiple strings here (one as a response for our
   ;; request, and a notification for the status change)
+  ;; TODO: Is there a way to get a substring without making a new string?
   (dolist (response-string (string-split input-string "\n" t))
     (let* ((response (json-parse-string response-string :object-type 'alist))
            (id (map-elt response 'id)))
@@ -256,10 +271,13 @@
 
 ;; Commands
 
+(defun edelve--ensure-halted ()
+  (when (edelve--process-running-p)
+    (edelve-halt)))
+
 (defun edelve--request-state ()
   "Request program state even the program is running"
   (edelve--send "RPCServer.State" '((NonBlocking . t))))
-
 
 (defun edelve--request-stacktrace ()
   (edelve--send "RPCServer.Stacktrace" `((Id . ,(edelve--get-current-goroutine-id))
@@ -304,7 +322,11 @@ Halt the process first to set a breakpoint.
 ;; Dissecting state
 
 (defun edelve--get-current-goroutine-id ()
+  ;; TODO: use SelectedGoroutine here!
   (map-nested-elt edelve--process-state '(currentThread goroutineID)))
+
+(defun edelve--process-running-p ()
+  (eq (edelve--get-process-state) 'run))
 
 (defun edelve--get-process-state ()
   (if edelve--process-state
