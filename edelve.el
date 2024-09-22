@@ -82,6 +82,7 @@
     (go-mode))
 
   ;; TODO: use global minor mode
+  (edelve-setup-default-keymap)
   (setq global-mode-string '(:eval (if-let (state (edelve--get-process-state))
                                        (format "[edlv:%s]" state)
                                      "[edlv]")))
@@ -125,9 +126,10 @@
 
 (defun edelve-continue ()
   (interactive)
-  (edelve--send "RPCServer.Command" `((name . "continue")
-                                      (ReturnInfoLoadConfig . ,edelve--load-config)))
-  (edelve--request-state))
+  (unless (edelve--process-running-p)
+    (edelve--send "RPCServer.Command" `((name . "continue")
+                                        (ReturnInfoLoadConfig . ,edelve--load-config)))
+    (edelve--request-state)))
 
 (defun edelve-halt ()
   (interactive)
@@ -135,24 +137,29 @@
 
 (defun edelve-next ()
   (interactive)
-  (edelve--send "RPCServer.Command" '((name . "next"))))
+  (edelve--when-not-running
+   (edelve--send "RPCServer.Command" '((name . "next")))))
 
 (defun edelve-step ()
   (interactive)
-  (edelve--send "RPCServer.Command" '((name . "step"))))
+  (edelve--when-not-running
+    (edelve--send "RPCServer.Command" '((name . "step")))))
 
 (defun edelve-up ()
   (interactive)
-  (edelve--send "RPCServer.Stacktrace" `((Id . -1) (Depth . ,(cl-incf edelve--process-stack-depth)))))
+  (edelve--when-not-running
+    (edelve--send "RPCServer.Stacktrace" `((Id . -1) (Depth . ,(cl-incf edelve--process-stack-depth))))))
 
 (defun edelve-down ()
   (interactive)
-  (edelve--send "RPCServer.Stacktrace" `((Id . -1) (Depth . ,(cl-decf edelve--process-stack-depth)))))
+  (edelve--when-not-running
+    (edelve--send "RPCServer.Stacktrace" `((Id . -1) (Depth . ,(cl-decf edelve--process-stack-depth))))))
 
-(defun edelve-toggle-breakpoint ()
+(defun edelve-toggle-breakpoint (&optional location)
+  "LOCATION should be (file . line)"
   (interactive)
-  (let* ((file (buffer-file-name))
-         (line (line-number-at-pos))
+  (let* ((file (if location (car location) (buffer-file-name)))
+         (line (if location (cdr location) (line-number-at-pos)))
          (loc (format "%s:%d" file line))
          (action (if-let ((breakpoint (edelve--get-breakpoint file line)))
                      (lambda ()
@@ -169,17 +176,19 @@
 
 (defun edelve-eval (&optional expr)
   (interactive "sExpr: ")
-  (if expr
-      (edelve--eval expr)
-    (user-error "Cannot evaluate empty expression")))
+  (edelve--when-not-running
+   (if expr
+       (edelve--eval expr)
+     (user-error "Cannot evaluate empty expression"))))
 
 (defun edelve-print-dwim ()
   (interactive)
-  (if (region-active-p)
-      (let ((region-string (buffer-substring-no-properties (region-beginning) (region-end))))
-        (edelve-eval region-string))
-    (let ((thing (thing-at-point 'sexp)))
-      (edelve-eval thing))))
+  (edelve--when-not-running
+   (if (region-active-p)
+       (let ((region-string (buffer-substring-no-properties (region-beginning) (region-end))))
+         (edelve-eval region-string))
+     (let ((thing (thing-at-point 'sexp)))
+       (edelve-eval thing)))))
 
 
 ;;; UI stuff
@@ -276,12 +285,17 @@
 
       (setq edelve--last-response response))))
 
+(defmacro edelve--when-not-running (&rest body)
+  `(if (edelve--process-running-p)
+       (message "Process is running. Use (edelv-halt) to stop it.")
+     ,@body))
+
 (defun edelve--send (method &optional params)
   ;; NOTE dlv uses jsonrpc 1.0
   (let ((data (json-serialize `((method . ,method)
                                 (params . [,params])
                                 (id  . ,(cl-incf edelve--jsonrpc-id))))))
-    (edelve--log "Sending %s" data)
+    (edelve--trace "Sending %s" data)
     (map-put! edelve--requests edelve--jsonrpc-id method)
     (process-send-string edelve--connection data)))
 
@@ -304,7 +318,7 @@
 (defun edelve--handle-state (state)
   (setq edelve--process-state state)
   (pcase (edelve--get-process-state)
-    ('run (delete-overlay edelve--line-fringe))
+    ('run (when edelve--line-fringe (delete-overlay edelve--line-fringe)))
     ('stop (edelve--jump-to-current-line))))
 
 (defun edelve--handle-eval-result (result)
@@ -478,7 +492,7 @@ Halt the process first to set a breakpoint.
                 (princ (format "???\n"))))
       ('String
        (princ (format "%s: \"%s\"\n" (map-elt variable 'name) (map-elt variable 'value)) stream))
-      ((or 'Bool 'Uint 'Int)
+      ((or 'Bool 'Uint 'Int 'Float32 'Float64)
        (princ (format "%s: %s\n" (map-elt variable 'name) (map-elt variable 'value)) stream))
       (_ ; (edelve--log "kind is not supported %s" kind)
          (princ (format "%s: %s (xxx)\n" (map-elt variable 'name) (map-elt variable 'type)) stream))))
@@ -494,61 +508,28 @@ Halt the process first to set a breakpoint.
    (message "edelve: %s" (apply #'format fmt args))))
 
 
-;;; Debug session
+;;; Debug stuff
 
-(edelve--send "RPCServer.GetVersion" '())
-(edelve--send "RPCServer.IsMulticlient" '())
-(edelve--send "RPCServer.Recorded" '())
+;; (edelve--send "RPCServer.GetVersion" '())
+;; (edelve--send "RPCServer.IsMulticlient" '())
+;; (edelve--send "RPCServer.Recorded" '())
 
-(edelve--send "RPCServer.FindLocation" '((Scope . ((GoroutineID . -1)
-                                                   (Frame . 0)
-                                                   (DeferredCall . 0)))
-                                         (Loc . "main.go:549")
-                                         (IncludeNonExecutableLines . :false)
-                                         (SubstitutePathRules . :null)))
-
-;; So, to create a breakpoint while the program is running, we halt
-;; it, create a breakpoint and continue
-
-
-;; RPCServer.Stacktrace(rpc2.StacktraceIn{"Id":1,"Depth":50,"Full":false,"Defers":false,"Opts":0,"Cfg":{"FollowPointers":true,"MaxVariableRecurse":1,"MaxStringLen":64,"MaxArrayValues":64,"MaxStructFields":-1}})
+;; (edelve--send "RPCServer.FindLocation" '((Scope . ((GoroutineID . -1)
+;;                                                    (Frame . 0)
+;;                                                    (DeferredCall . 0)))
+;;                                          (Loc . "main.go:549")
+;;                                          (IncludeNonExecutableLines . :false)
+;;                                          (SubstitutePathRules . :null)))
 
 ;; RPCServer.ListLocalVars(rpc2.ListLocalVarsIn{"Scope":{"GoroutineID":22,"Frame":0,"DeferredCall":0},"Cfg":{"FollowPointers":true,"MaxVariableRecurse":1,"MaxStringLen":64,"MaxArrayValues":64,"MaxStructFields":-1}})
 ;; RPCServer.ListFunctionArgs(rpc2.ListFunctionArgsIn{"Scope":{"GoroutineID":22,"Frame":0,"DeferredCall":0},"Cfg":{"FollowPointers":true,"MaxVariableRecurse":1,"MaxStringLen":64,"MaxArrayValues":64,"MaxStructFields":-1}})
 
-
 ;; RPCServer.FindLocation(rpc2.FindLocationIn{"Scope":{"GoroutineID":-1,"Frame":0,"DeferredCall":0},"Loc":"main.go:549","IncludeNonExecutableLines":false,"SubstitutePathRules":null})
-
-;; RPCServer.CreateBreakpoint(rpc2.CreateBreakpointIn{"Breakpoint":{"id":0,"name":"","addr":8760041,"addrs":[8760041],"addrpid":[711336],"file":"","line":0,"ExprString":"","Cond":"","HitCond":"","HitCondPerG":false,"continue":false,"traceReturn":false,"goroutine":false,"stacktrace":0,"LoadArgs":null,"LoadLocals":null,"WatchExpr":"","WatchType":0,"hitCount":null,"totalHitCount":0,"disabled":false,"RootFuncName":"","TraceFollowCalls":0},"LocExpr":"main.go:549","SubstitutePathRules":null,"Suspended":false})
-
 
 ;; RPCServer.LastModified(rpc2.LastModifiedIn{})
 ;; RPCServer.AttachedToExistingProcess(rpc2.AttachedToExistingProcessIn{})
-;; RPCServer.Detach(rpc2.DetachIn{"Kill":true})
-
 
 ;; TODO: we get multiple process filter calls with parts of the huge json here. Do something about it.
-(edelve--send "RPCServer.ListFunctions" '(:Filter "" :FollowCalls 0))
+;; (edelve--send "RPCServer.ListFunctions" '(:Filter "" :FollowCalls 0))
 
-;;
-
-(edelve)
-(edelve-setup-default-keymap)
-(edelve-continue)
-
-(edelve-halt)
-(edelve--create-breakpoint "main.go:511")
-(edelve-continue)
-
-(edelve--request-breakpoints)
-(edelve--pp-breakpoints)
-
-(edelve-next)
-
-(edelve--pp-where)
-(edelve--eval "pl")
-(edelve--pp-eval-result)
-
-(edelve-quit)
-
-(set-window-fringes (selected-window) 30 0)
+(provide 'edelve)
