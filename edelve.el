@@ -1,13 +1,16 @@
 ;; -*- lexical-binding: t; -*-
+;; ## Debugging notes
+;; Call (edelve--reset-state) to reset everything.
 ;;
-;; Implementation notes
+;; ## Implementation notes
 ;;
-;; # JSON RPC
+;; ### JSON RPC
 ;;
 ;; There is builtin (require 'jsonrpc). But it sends Content-Length
 ;; header, which dlv doesn't support. Hence we just open a socket and
 ;; send json directly.
-
+;;
+;; ### How to debug dlv itself
 ;; dlv debug --headless --api-version=2 --log --log-output=debugger,dap,rpc --listen=127.0.0.1:8181
 
 ;; TODO: json-serialize
@@ -28,6 +31,18 @@
   "Face for enabled breakpoint icon in fringe."
   :group 'edelve)
 
+(defcustom edelve-dlv-program "dlv"
+  "Path to `dlv' executable")
+
+(defcustom edelve-dlv-args '("debug" "--headless")
+  "Arguments to path to the `dlv' executable.")
+
+(defcustom edelve-dlv-remote-addr nil
+  "Remote `dlv' instance address.\
+This will be used instead of `edelve-dlv-program'. \
+Run `dlv' as `dlv debug --headless --listen=127.0.0.1:8181'.
+Then set this variable to '127.0.0.1:8181'")
+
 (defvar edelve--connection nil)
 (defvar edelve--jsonrpc-id 0)
 
@@ -36,13 +51,17 @@
 (defvar edelve--breakpoints nil)
 (defvar edelve--breakpoint-fringes nil)
 
-(defvar edelve--process-state nil)
+(defvar edelve--process nil "dlv process.")
+
+(defvar edelve--process-state nil "Debugging target process.")
+(defvar edelve--process-buffer nil)
 (defvar edelve--process-stacktrace nil)
 (defvar edelve--process-breakpoints nil)
 (defvar edelve--process-stack-depth 0)
 
 (defvar edelve--eval-result nil)
 (defvar edelve--buffer nil)
+(defvar edelve--log-buffer nil)
 (defvar edelve--line-fringe nil)
 
 ;; TODO: this is used for debugging. Remove me
@@ -74,25 +93,17 @@
 
   (edelve--reset-state)
 
-  (setq edelve--buffer (get-buffer-create "*edelve*"))
+  (edelve--create-buffer edelve--buffer "*edelve*" go-mode) ; TODO: don't depend on go-mode here!!!
+  (edelve--create-buffer edelve--log-buffer "*edelve-log*")
+  (edelve--create-buffer edelve--process-buffer "*edelve-process-output*")
 
-  (with-current-buffer edelve--buffer
-    (erase-buffer)
-    ;; TODO: don't depend on go-mode here!!!
-    (go-mode))
+  (edelve--start-process)
 
   ;; TODO: use global minor mode
   (edelve-setup-default-keymap)
   (setq global-mode-string '(:eval (if-let (state (edelve--get-process-state))
                                        (format "[edlv:%s]" state)
-                                     "[edlv]")))
-
-  (setq edelve--connection (open-network-stream "edelve" nil "127.0.0.1" "8181"))
-
-  (set-process-filter edelve--connection #'edelve--connection-filter)
-
-  (edelve--send "RPCServer.SetApiVersion" '((APIVersion . 2)))
-  (edelve--request-state))
+                                     "[edlv]"))))
 
 (defun edelve-setup-default-keymap (&optional map)
   (unless map
@@ -110,8 +121,9 @@
 
 (defun edelve-quit ()
   (interactive)
-  (edelve--ensure-halted)
-  (edelve--send "RPCServer.Detach")
+  (when edelve--connection
+    (edelve--ensure-halted)
+    (edelve--send "RPCServer.Detach"))
   (edelve--reset-state))
 
 ;; Commands
@@ -126,6 +138,7 @@
 
 (defun edelve-continue ()
   (interactive)
+  (edelve--ensure)
   (unless (edelve--process-running-p)
     (edelve--send "RPCServer.Command" `((name . "continue")
                                         (ReturnInfoLoadConfig . ,edelve--load-config)))
@@ -133,6 +146,7 @@
 
 (defun edelve-halt ()
   (interactive)
+  (edelve--ensure)
   (edelve--send "RPCServer.Command" '((name . "halt") (ReturnInfoLoadConfig . :null))))
 
 (defun edelve-next ()
@@ -158,6 +172,7 @@
 (defun edelve-toggle-breakpoint (&optional location)
   "LOCATION should be (file . line)"
   (interactive)
+  (edelve--ensure)
   (let* ((file (if location (car location) (buffer-file-name)))
          (line (if location (cdr location) (line-number-at-pos)))
          (loc (format "%s:%d" file line))
@@ -250,17 +265,85 @@
 
   (setq edelve--connection nil)
 
+  (when (process-live-p edelve--process)
+    (delete-process edelve--process))
+
+  (setq edelve--process nil)
+
   (setq edelve--requests (make-hash-table))
   (setq edelve--breakpoints (make-hash-table))
   (setq edelve--breakpoint-fringes (make-hash-table))
 
+  (edelve--kill-buffer edelve--process-buffer)
+  (edelve--kill-buffer edelve--log-buffer)
+  (edelve--kill-buffer edelve--buffer)
+
   (setq edelve--process-state nil)
+
   (setq edelve--process-stacktrace nil)
   (setq edelve--process-breakpoints nil)
   (setq edelve--last-response nil)
   (setq edelve--eval-result nil)
 
   (setq edelve--jsonrpc-id 0))
+
+(defun edelve--start-process ()
+  (cl-assert (null edelve--process))
+  (if edelve-dlv-remote-addr
+      (edelve--process-connect edelve-dlv-remote-addr)
+      (setq edelve--process (make-process :name "dlv"
+                                          :buffer edelve--process-buffer
+                                          :command (append (list edelve-dlv-program) edelve-dlv-args)
+                                          :filter #'edelve--process-startup-filter
+                                          :sentinel #'edelve--process-sentinel))))
+
+(defun edelve--process-startup-filter (process input-string)
+  (edelve--trace "`dlv' filter: %s" input-string)
+  (set-process-filter process nil)
+  (pcase input-string
+    ((rx "listening at: " (group (* any)))
+     (let ((addr (match-string 1 input-string)))
+       (edelve--log "listening at %s" addr)
+       (edelve--process-connect addr)))
+    ((rx "cannot find main module")
+     (edelve--error "Cannot find go module to debug. \
+Please ensure that you are running (edelve) within a go project directory."))
+    (_ (edelve--error "Cannot connect to `dlv' because it didn't specify which port it is listening on."))))
+
+(defun edelve--process-sentinel (process event)
+  (edelve--trace "`dlv' sentinel: %s" event)
+  (pcase event
+    ("killed\n" (edelve--log "`dlv' process was killed")
+     (edelve--reset-state))
+    ((rx "exited abnormally with code " (group (? digit)))
+     (let ((code (match-string 1 event)))
+       (when edelve--connection
+           (edelve--error "`dlv' process exited with code %s" code))
+       (edelve-quit)))))
+
+(defun edelve--process-connect (addr)
+  (pcase (split-string addr ":")
+    (`(,host ,port)
+
+     (setq edelve--connection (open-network-stream "edelve" nil host port))
+     (set-process-filter edelve--connection #'edelve--connection-filter)
+
+     (edelve--send "RPCServer.SetApiVersion" '((APIVersion . 2)))
+     (edelve--request-state))
+    (_ (edelve--error "cannot parse dlv addr '%s'" addr)
+       (edelve-quit))))
+
+(defmacro edelve--create-buffer (variable name &optional mode)
+  `(progn
+     (setq ,variable (get-buffer-create ,name))
+     (with-current-buffer ,variable
+       (erase-buffer)
+       ,(when mode (list mode)))))
+
+(defmacro edelve--kill-buffer (buffer)
+  `(when (buffer-live-p ,buffer)
+     (kill-buffer ,buffer)
+     (setq buffer nil)))
 
 ;; Connection related things
 
@@ -286,9 +369,11 @@
       (setq edelve--last-response response))))
 
 (defmacro edelve--when-not-running (&rest body)
-  `(if (edelve--process-running-p)
-       (message "Process is running. Use (edelv-halt) to stop it.")
-     ,@body))
+  `(progn
+     (edelve--ensure)
+     (if (edelve--process-running-p)
+         (message "Process is running. Use (edelv-halt) to stop it.")
+       ,@body)))
 
 (defun edelve--send (method &optional params)
   ;; NOTE dlv uses jsonrpc 1.0
@@ -351,7 +436,12 @@
 
 ;; Commands
 
+(defun edelve--ensure ()
+  (unless edelve--connection
+    (user-error "Edelve is not running. Try `M-x edelve'")))
+
 (defun edelve--ensure-halted ()
+  (edelve--ensure)
   (when (edelve--process-running-p)
     (edelve-halt)))
 
@@ -512,12 +602,15 @@ Halt the process first to set a breakpoint.
 
 ;; Utils
 
+(defun edelve--error (fmt &rest args)
+  (message "edelve error: %s" (apply #'format fmt args)))
+
 (defun edelve--log (fmt &rest args)
   (message "edelve: %s" (apply #'format fmt args)))
 
 (defun edelve--trace (fmt &rest args)
-  (if nil
-   (message "edelve: %s" (apply #'format fmt args))))
+  (with-current-buffer edelve--log-buffer
+    (insert (apply #'format fmt args) "\n")))
 
 
 ;;; Debug stuff
