@@ -121,13 +121,17 @@ Then set this variable to '127.0.0.1:8181'")
           :help "Edelve stuff"
           ["Halt" edelve-halt :help "Halt the execution"]))
 
+;; TODO: enable this mode in supported buffers instead of via the mode hook
 (define-minor-mode edelve-minor-mode
   "Minor mode for go buffers that can interract with `dlv'."
-  :lighter (:eval (edelve-modeline-string))
+  :init-value nil
+  :lighter nil ;; (:eval (edelve-modeline-string))
   :keymap edelve-minor-mode-map)
 
+(add-to-list 'mode-line-misc-info `(edelve-minor-mode (" [" (:eval (edelve-modeline-string)) "]")))
+
 (defun edelve-modeline-string ()
-  (list " edlv:"
+  (list "edlv:"
         (if-let (state (edelve--get-process-state))
             (propertize (symbol-name state) 'face (pcase state ;; TODO: introduce out own inherited fonts
                                                     ('stop 'warning)
