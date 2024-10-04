@@ -68,7 +68,7 @@ Then set this variable to '127.0.0.1:8181'")
 (defvar edelve--last-response nil)
 
 (defvar edelve--load-config '((FollowPointers . t)
-                              (MaxVariableRecurse . 3)
+                              (MaxVariableRecurse . 1)
                               (MaxStringLen . 64)
                               (MaxArrayValues . 64)
                               (MaxStructFields . -1)))
@@ -99,25 +99,40 @@ Then set this variable to '127.0.0.1:8181'")
 
   (edelve--start-process)
 
-  ;; TODO: use global minor mode
-  (edelve-setup-default-keymap)
-  (setq global-mode-string '(:eval (if-let (state (edelve--get-process-state))
-                                       (format "[edlv:%s]" state)
-                                     "[edlv]"))))
+  (edelve--enable-minor-mode-in-project))
 
-(defun edelve-setup-default-keymap (&optional map)
-  (unless map
-    (setq map 'go-mode-map))
-  (bind-key "<f5>" #'edelve-restart map)
-  (bind-key "<f8>" #'edelve-continue map)
-  (bind-key "S-<f8>" #'edelve-halt map)
-  (bind-key "<f9>" #'edelve-toggle-breakpoint map)
-  (bind-key "<f10>" #'edelve-next map)
-  (bind-key "<f11>" #'edelve-step map)
-  (bind-key "C-c C-u" #'edelve-up map)
-  (bind-key "C-c C-d" #'edelve-down map)
-  (bind-key "C-c C-e" #'edelve-eval map)
-  (bind-key "C-c C-p" #'edelve-print-dwim map))
+(defvar-keymap edelve-minor-mode-map
+  :doc "Keymap for edelve-minor-mode."
+  "<f5>" #'edelve-restart
+  "<f8>" #'edelve-continue
+  "S-<f8>" #'edelve-halt
+  "<f9>" #'edelve-toggle-breakpoint
+  "<f10>" #'edelve-next
+  "<f11>" #'edelve-step
+
+  ;; TODO: figure how to enable repeat mode
+  "C-c C-p" #'edelve-print-dwim
+  "C-c C-u" #'edelve-up
+  "C-c C-d" #'edelve-down
+  "C-c C-e" #'edelve-eval
+
+  ;; TODO this doesn't work with (list) in the modestring. Check out how it's done in flymake
+  :menu '("Edelve"
+          :help "Edelve stuff"
+          ["Halt" edelve-halt :help "Halt the execution"]))
+
+(define-minor-mode edelve-minor-mode
+  "Minor mode for go buffers that can interract with `dlv'."
+  :lighter (:eval (edelve-modeline-string))
+  :keymap edelve-minor-mode-map)
+
+(defun edelve-modeline-string ()
+  (list " edlv:"
+        (if-let (state (edelve--get-process-state))
+            (propertize (symbol-name state) 'face (pcase state ;; TODO: introduce out own inherited fonts
+                                                    ('stop 'warning)
+                                                    ('run 'success)))
+          "-")))
 
 (defun edelve-quit ()
   (interactive)
@@ -286,6 +301,18 @@ Then set this variable to '127.0.0.1:8181'")
   (setq edelve--eval-result nil)
 
   (setq edelve--jsonrpc-id 0))
+
+(defun edelve--enable-minor-mode-in-project (&optional project)
+  "Enabled `edelve-minor-mode' for all go buffers in the PROJECT."
+  ;; TODO: Make configurable (including which modes to enable minor mode in)
+  (unless project
+    (setq project (project-current)))
+  (when project
+    (dolist (buffer (project-buffers project))
+      (with-current-buffer buffer
+        (when (seq-some #'derived-mode-p '(go-mode go-ts-mode))
+          (message "Enabling in %s" (buffer-name))
+          (edelve-minor-mode))))))
 
 (defun edelve--start-process ()
   (cl-assert (null edelve--process))
