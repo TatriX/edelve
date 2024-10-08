@@ -152,15 +152,16 @@ Then set this variable to '127.0.0.1:8181'")
   (edelve--ensure-halted)
   ;; TODO: Customize rebuild
   (setq edelve--process-stack-depth 0)
-  (edelve--send "RPCServer.Restart" '((Rebuild . t)))
-  (edelve-continue))
+  (edelve--send "RPCServer.Restart" '((Rebuild . t)) #'edelve-continue))
 
 (defun edelve-continue ()
   (interactive)
   (edelve--ensure)
   (unless (edelve--process-running-p)
-    (edelve--send "RPCServer.Command" `((name . "continue")
-                                        (ReturnInfoLoadConfig . ,edelve--load-config)))
+    (edelve--send "RPCServer.Command"
+                  `((name . "continue") (ReturnInfoLoadConfig . ,edelve--load-config)))
+    ;; Response to "continue" will arrive only after we halt the
+    ;; target.  Hence we request the state with a nonblocking flag.
     (edelve--request-state)))
 
 (defun edelve-halt ()
@@ -315,7 +316,7 @@ Then set this variable to '127.0.0.1:8181'")
     (dolist (buffer (project-buffers project))
       (with-current-buffer buffer
         (when (seq-some #'derived-mode-p '(go-mode go-ts-mode))
-          (message "Enabling in %s" (buffer-name))
+          (edelve--trace "Enabling edelve-minor-mode in %s" (buffer-name))
           (edelve-minor-mode))))))
 
 (defun edelve--start-process ()
@@ -391,11 +392,12 @@ Please ensure that you are running (edelve) within a go project directory."))
            (id (map-elt response 'id)))
       (if (eq id :null)
           (edelve--log "Got notification from the server (id: %d)" id)
-        (let ((method (map-elt edelve--requests id)))
-          (cl-assert method)
+        (pcase-let ((`(,method ,callback) (map-elt edelve--requests id)))
           (edelve--trace "Got response with id %d for method %s" id method)
           (map-delete edelve--requests id)
-          (edelve--handle-response method response)))
+          (edelve--handle-response method response)
+          (when callback
+            (funcall callback))))
 
       (setq edelve--last-response response))))
 
@@ -406,13 +408,13 @@ Please ensure that you are running (edelve) within a go project directory."))
          (message "Process is running. Use (edelv-halt) to stop it.")
        ,@body)))
 
-(defun edelve--send (method &optional params)
+(defun edelve--send (method &optional params callback)
   ;; NOTE dlv uses jsonrpc 1.0
   (let ((data (json-serialize `((method . ,method)
                                 (params . [,params])
                                 (id  . ,(cl-incf edelve--jsonrpc-id))))))
     (edelve--trace "Sending %s" data)
-    (map-put! edelve--requests edelve--jsonrpc-id method)
+    (map-put! edelve--requests edelve--jsonrpc-id (list method callback))
     (process-send-string edelve--connection data)))
 
 (defun edelve--handle-response (method response)
