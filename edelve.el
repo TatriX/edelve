@@ -95,7 +95,7 @@ Then set this variable to '127.0.0.1:8181'")
 
   (edelve--create-buffer edelve--buffer "*edelve*" go-mode) ; TODO: don't depend on go-mode here!!!
   (edelve--create-buffer edelve--log-buffer "*edelve-log*")
-  (edelve--create-buffer edelve--process-buffer "*edelve-process-output*")
+  (edelve--create-buffer edelve--process-buffer "*edelve-process-output*" edelve-minor-mode)
 
   (edelve--start-process)
 
@@ -152,7 +152,8 @@ Then set this variable to '127.0.0.1:8181'")
   (edelve--ensure-halted)
   ;; TODO: Customize rebuild
   (setq edelve--process-stack-depth 0)
-  (edelve--send "RPCServer.Restart" '((Rebuild . t)) #'edelve-continue))
+  (edelve--send "RPCServer.Restart" '((Rebuild . t)) #'edelve-continue)
+  (display-buffer edelve--process-buffer))
 
 (defun edelve-continue ()
   (interactive)
@@ -380,10 +381,14 @@ Please ensure that you are running (edelve) within a go project directory."))
 ;; Connection related things
 
 (defun edelve--connection-filter (process input-string)
-  (with-current-buffer (get-buffer-create "debug.json")
-    (erase-buffer)
-    (insert input-string)
-    (json-pretty-print-buffer))
+  ;; NOTE: Write nicely formatted data into a buffer for debugging
+  (when nil
+    (with-current-buffer (get-buffer-create "*edelve-debug*")
+      (erase-buffer)
+      (js-json-mode)
+      (insert input-string)
+      (json-pretty-print-buffer)))
+
   ;; NOTE: we can get multiple strings here (one as a response for our
   ;; request, and a notification for the status change)
   ;; TODO: Is there a way to get a substring without making a new string?
