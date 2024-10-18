@@ -22,7 +22,6 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'map)
-(require 'bind-key)
 
 (defface edelve-breakpoint-enabled
   '((t
@@ -42,6 +41,11 @@
 This will be used instead of `edelve-dlv-program'. \
 Run `dlv' as `dlv debug --headless --listen=127.0.0.1:8181'.
 Then set this variable to '127.0.0.1:8181'")
+
+(defcustom edelve-process-output-bufer-name "*edelve-process-output*"
+  "Name of a buffer into which your process output will be delivered.")
+
+;;; Internal variables
 
 (defvar edelve--connection nil)
 (defvar edelve--jsonrpc-id 0)
@@ -95,7 +99,7 @@ Then set this variable to '127.0.0.1:8181'")
 
   (edelve--create-buffer edelve--buffer "*edelve*" go-mode) ; TODO: don't depend on go-mode here!!!
   (edelve--create-buffer edelve--log-buffer "*edelve-log*")
-  (edelve--create-buffer edelve--process-buffer "*edelve-process-output*" edelve-minor-mode)
+  (edelve--create-buffer edelve--process-buffer edelve-process-output-bufer-name edelve-minor-mode)
 
   (edelve--start-process)
 
@@ -115,6 +119,8 @@ Then set this variable to '127.0.0.1:8181'")
   "C-c C-u" #'edelve-up
   "C-c C-d" #'edelve-down
   "C-c C-e" #'edelve-eval
+
+  "C-c C-z" #'edelve-display-dwim
 
   ;; TODO this doesn't work with (list) in the modestring. Check out how it's done in flymake
   :menu '("Edelve"
@@ -225,6 +231,14 @@ Then set this variable to '127.0.0.1:8181'")
          (edelve-eval region-string))
      (let ((thing (thing-at-point 'sexp)))
        (edelve-eval thing)))))
+
+(defun edelve-display-dwim ()
+  (interactive)
+  (if (eq (current-buffer) edelve--process-buffer)
+      (next-buffer) ;; TODO make something better here
+    (if (buffer-live-p edelve--process-buffer)
+        (display-buffer edelve--process-buffer)
+      (edelve--log "No live process"))))
 
 
 ;;; UI stuff
