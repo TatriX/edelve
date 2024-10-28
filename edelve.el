@@ -114,11 +114,10 @@ Then set this variable to '127.0.0.1:8181'")
   "<f10>" #'edelve-next
   "<f11>" #'edelve-step
 
-  ;; TODO: figure how to enable repeat mode
   "C-c C-p" #'edelve-print-dwim
+  "C-c C-e" #'edelve-eval
   "C-c C-u" #'edelve-up
   "C-c C-d" #'edelve-down
-  "C-c C-e" #'edelve-eval
 
   "C-c C-z" #'edelve-display-dwim
 
@@ -126,6 +125,13 @@ Then set this variable to '127.0.0.1:8181'")
   :menu '("Edelve"
           :help "Edelve stuff"
           ["Halt" edelve-halt :help "Halt the execution"]))
+
+(defvar-keymap edelve-minor-mode-repeat-map
+  :doc "Keymap to repeat navigation commands.
+Used in `repeat-mode'"
+  :repeat t
+  "C-u" #'edelve-up
+  "C-d" #'edelve-down)
 
 ;; TODO: enable this mode in supported buffers instead of via the mode hook
 (define-minor-mode edelve-minor-mode
@@ -203,7 +209,7 @@ Then set this variable to '127.0.0.1:8181'")
   (let* ((file (if location (car location) (buffer-file-name)))
          (line (if location (cdr location) (line-number-at-pos)))
          (loc (format "%s:%d" file line))
-         (action (if-let ((breakpoint (edelve--get-breakpoint file line)))
+         (action (if-let* ((breakpoint (edelve--get-breakpoint file line)))
                      (lambda ()
                        (edelve--log "Clearing breakpoint at %s" loc)
                        (edelve--clear-breakpoint (map-elt breakpoint 'id)))
